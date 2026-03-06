@@ -144,7 +144,15 @@ class GSABaseAttributionMethod(BlackBoxExplainer):
             perturbator = self.perturbation_function(inp)
             outputs = None
 
-            for batch_masks in batch_tensor(self.masks, self.batch_size):
+            # Calculate total number of batches for progress tracking
+            total_masks = len(self.masks)
+            print(f"\nComputing perturbations on {total_masks} masks...")
+            for batch_idx, batch_masks in enumerate(batch_tensor(self.masks, self.batch_size)):
+                print(
+                    f"\r    Processing mask {batch_idx * self.batch_size + 1}/{total_masks}...",
+                    end="",
+                    flush=True,
+                )
                 batch_x, batch_y = self._batch_perturbations(
                     batch_masks, perturbator, target, input_shape
                 )
@@ -154,6 +162,8 @@ class GSABaseAttributionMethod(BlackBoxExplainer):
                     if outputs is None
                     else tf.concat([outputs, batch_outputs], axis=0)
                 )
+            # Print newline after finishing all batches
+            print("done")
 
             heatmap = self.estimator(self.masks, outputs, self.nb_design)
             if tf.rank(heatmap) == 2:
