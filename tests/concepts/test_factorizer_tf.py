@@ -28,7 +28,8 @@ def _nmf_encoding_objective(activations, coefficients, concept_bank, alpha_w, l1
 
 
 @pytest.mark.parametrize("alpha_w,l1_ratio", [(0.0, 0.0), (0.05, 0.3)])
-def test_tf_encode_differentiable_matches_sklearn_transform(alpha_w, l1_ratio):
+@pytest.mark.parametrize("tol", [1e-6, 0.0])
+def test_tf_encode_differentiable_matches_sklearn_transform(alpha_w, l1_ratio, tol):
     """The differentiable TF solver should match sklearn's fixed-dictionary transform."""
     train = _make_non_negative_data(0, (80, 12))
     test = _make_non_negative_data(1, (20, 12))
@@ -38,7 +39,7 @@ def test_tf_encode_differentiable_matches_sklearn_transform(alpha_w, l1_ratio):
         alpha_W=alpha_w,
         l1_ratio=l1_ratio,
         max_iter=1000,
-        tol=1e-6,
+        tol=tol,
         random_state=0,
     )
     factorizer.fit(train)
@@ -67,7 +68,8 @@ def test_tf_encode_differentiable_matches_sklearn_transform(alpha_w, l1_ratio):
     assert reconstruction_error / (reconstruction_norm + 1e-8) < 0.05
 
 
-def test_tf_encode_differentiable_preserves_gradients():
+@pytest.mark.parametrize("tol", [1e-6, 0.0])
+def test_tf_encode_differentiable_preserves_gradients(tol):
     """The differentiable solver should backpropagate through activations."""
     train = _make_non_negative_data(2, (60, 10))
     test = tf.constant(_make_non_negative_data(3, (16, 10)))
@@ -76,7 +78,7 @@ def test_tf_encode_differentiable_preserves_gradients():
         n_components=4,
         alpha_W=1e-2,
         max_iter=500,
-        tol=1e-6,
+        tol=tol,
         random_state=0,
     )
     factorizer.fit(train)
@@ -91,6 +93,18 @@ def test_tf_encode_differentiable_preserves_gradients():
     assert gradients is not None
     assert tf.reduce_all(tf.math.is_finite(gradients))
     assert tf.reduce_sum(tf.abs(gradients)) > 0
+
+
+def test_tf_encode_differentiable_rejects_negative_activations():
+    """NMF encoding should fail when differentiable inputs are negative."""
+    train = _make_non_negative_data(6, (30, 6), minimum=0.1)
+    test = tf.constant(-_make_non_negative_data(7, (10, 6), minimum=0.1))
+
+    factorizer = TfSklearnNMFFactorizer(n_components=3, max_iter=200, random_state=0)
+    factorizer.fit(train)
+
+    with pytest.raises(tf.errors.InvalidArgumentError):
+        factorizer.encode_differentiable(test)
 
 
 def test_tf_encode_differentiable_rejects_unsupported_beta_loss():
