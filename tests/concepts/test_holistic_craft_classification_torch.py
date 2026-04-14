@@ -317,6 +317,8 @@ def test_craft_encode_differentiable_gradients(image_data, craft_data):
     # Verify coeffs_u is a tensor with gradients
     expected_msg = "coeffs_u should be a torch.Tensor in differentiable mode"
     assert isinstance(coeffs_u, torch.Tensor), expected_msg
+    assert torch.all(torch.isfinite(coeffs_u)).item(), "coeffs_u should be finite"
+    assert torch.min(coeffs_u).item() >= -1e-6, "coeffs_u should remain non-negative"
     assert coeffs_u.requires_grad, "coeffs_u should have gradients enabled"
 
     # Create a simple loss and check gradient flow
