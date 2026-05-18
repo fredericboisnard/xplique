@@ -4,13 +4,26 @@ Base classes for latent extraction in deep learning models.
 
 import contextlib
 from abc import ABC, abstractmethod
-from typing import Any, Callable, NamedTuple, Optional, Union
+from typing import Any, Callable, Generator, NamedTuple, Optional, Protocol, Union, runtime_checkable
 
 import numpy as np
 
-from xplique.utils_functions.object_detection.base.box_formatter import (
-    BaseBoxFormatter,
-)
+
+@runtime_checkable
+class LatentDataProtocol(Protocol):
+    """Protocol implemented by latent data containers used by latent extractors."""
+
+    def get_activations(self, as_numpy: bool = True, keep_gradients: bool = False):
+        """Retrieve activations in TensorFlow ordering (batch, height, width, channels)."""
+
+    def set_activations(self, values: Any) -> None:
+        """Set activations from TensorFlow ordering (batch, height, width, channels)."""
+
+    def detach(self) -> "LatentDataProtocol":
+        """Detach tensor state from the computation graph and return latent data."""
+
+    def to(self, device: Any) -> "LatentDataProtocol":
+        """Move tensor state to a device and return latent data."""
 
 
 class LatentData(ABC):
@@ -18,7 +31,13 @@ class LatentData(ABC):
 
     This class provides an interface for managing intermediate activations
     extracted from a model's latent space. Subclasses must implement methods
-    to get and set activations in a framework-specific manner.
+    to get and set activations in a framework-specific manner, and must expose
+    explicit tensor-state management for streaming/offload workflows.
+
+    ``detach()`` and ``to(device)`` may mutate the current instance or return a
+    new instance. In both cases they must return a LatentData-compatible object,
+    never ``None``. They must handle every tensor required by latent_to_logit(),
+    not only the selected activation tensor returned by get_activations().
     """
 
     @abstractmethod
@@ -51,6 +70,34 @@ class LatentData(ABC):
             (batch, height, width, channels).
         """
         raise NotImplementedError("set_activations method must be implemented by subclasses")
+
+    @abstractmethod
+    def detach(self) -> "LatentData":
+        """Detach tensor state from the computation graph.
+
+        Returns
+        -------
+        latent_data
+            A LatentData-compatible object containing detached tensor state.
+        """
+        raise NotImplementedError("detach method must be implemented by subclasses")
+
+    @abstractmethod
+    def to(self, device: Any) -> "LatentData":
+        """Move tensor state to the requested device.
+
+        Parameters
+        ----------
+        device
+            Framework-specific target device, such as ``"cpu"``, ``"cuda"``,
+            ``torch.device(...)``, or ``"/CPU:0"``.
+
+        Returns
+        -------
+        latent_data
+            A LatentData-compatible object containing tensor state on the target device.
+        """
+        raise NotImplementedError("to method must be implemented by subclasses")
 
 
 class EncodedData(NamedTuple):
@@ -108,7 +155,7 @@ class LatentExtractor(ABC):
         input_to_latent_model: Callable,
         latent_to_logit_model: Callable,
         latent_data_class=LatentData,
-        output_formatter: Optional[BaseBoxFormatter] = None,
+        output_formatter: Optional[Callable[[Any], Any]] = None,
         batch_size: int = 8,
     ):
         self.model = model
@@ -170,6 +217,53 @@ class LatentExtractor(ABC):
         """
         raise NotImplementedError("This method should be implemented in subclasses.")
 
+    @abstractmethod
+    def iter_input_to_latent_batched(
+        self,
+        inputs,
+        resize: Optional[Any] = None,
+        keep_gradients: bool = False,
+        **kwargs,
+    ) -> Generator[LatentData, None, None]:
+        """Stream latent representations batch by batch.
+
+        Parameters
+        ----------
+        inputs
+            Input data to process.
+        resize
+            Optional target size for resizing inputs.
+        keep_gradients
+            If True, preserve gradients during processing. Default is False.
+        **kwargs
+            Framework-specific streaming options, such as offload device.
+
+        Yields
+        ------
+        latent_data
+            LatentData object for each processed batch.
+
+        Raises
+        ------
+        NotImplementedError
+            This method must be implemented by subclasses.
+        """
+        raise NotImplementedError("This method should be implemented in subclasses.")
+
+    def input_to_latent_batched(
+        self,
+        inputs,
+        resize: Optional[Any] = None,
+        keep_gradients: bool = False,
+        **kwargs,
+    ) -> list[LatentData]:
+        """Extract latent representations with automatic batching.
+
+        This default implementation materializes the streaming iterator. Subclasses
+        may override it to expose framework-specific parameters in their signatures.
+        """
+        return list(self.iter_input_to_latent_batched(inputs, resize, keep_gradients, **kwargs))
+
     def forward(self, samples):
         """Forward pass through the full model via latent space.
 
@@ -185,6 +279,29 @@ class LatentExtractor(ABC):
         """
         latent_data = self.input_to_latent(samples)
         return self.latent_to_logit(latent_data)
+
+    @staticmethod
+    def _validate_latent_data_result(latent_data: Any, method_name: str) -> LatentDataProtocol:
+        """Validate that a LatentData method returned a usable latent-data object."""
+        if latent_data is None:
+            raise TypeError(
+                f"LatentData.{method_name}() must return a LatentData-compatible object, "
+                "got None. Methods may mutate in place, but must return self."
+            )
+        if not isinstance(latent_data, LatentDataProtocol):
+            raise TypeError(
+                f"LatentData.{method_name}() must return a LatentData-compatible object, "
+                f"got {type(latent_data).__name__}."
+            )
+        return latent_data
+
+    def _detach_latent_data(self, latent_data: LatentDataProtocol) -> LatentDataProtocol:
+        """Detach latent-data tensor state and validate the protocol return contract."""
+        return self._validate_latent_data_result(latent_data.detach(), "detach")
+
+    def _move_latent_data(self, latent_data: LatentDataProtocol, device: Any) -> LatentDataProtocol:
+        """Move latent-data tensor state and validate the protocol return contract."""
+        return self._validate_latent_data_result(latent_data.to(device), "to")
 
     @contextlib.contextmanager
     def temporary_force_batch_size(self, batch_size: int):

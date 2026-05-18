@@ -9,7 +9,7 @@ to ensure it correctly detects gradient flow in different model architectures.
 import pytest
 import torch
 
-from xplique.utils_functions.common.torch.gradients_check import check_model_gradients
+from tests.utils_functions.gradients_check_torch import check_model_gradients
 from xplique.utils_functions.object_detection.torch.multi_box_tensor import MultiBoxTensor
 
 

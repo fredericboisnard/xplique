@@ -1,5 +1,5 @@
 """
-TensorFlow gradient checking utilities for object detection models.
+TensorFlow gradient checking test helpers for object detection models.
 """
 
 from typing import Any, List

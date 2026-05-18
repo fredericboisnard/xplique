@@ -102,11 +102,17 @@ class HolisticCraftTorch(HolisticCraft):
         # Get activations as tensors with gradients preserved
         activations = latent_data.get_activations(as_numpy=False, keep_gradients=True)
 
-        # Ensure we have PyTorch tensors with gradients enabled
         if not isinstance(activations, torch.Tensor):
-            activations = torch.tensor(activations, requires_grad=True)
-        elif not activations.requires_grad:
-            activations = activations.clone().detach().requires_grad_(True)
+            raise TypeError(
+                "Differentiable Torch encoding requires latent activations to be "
+                f"torch.Tensor, got {type(activations).__name__}."
+            )
+        if not activations.requires_grad:
+            raise ValueError(
+                "Differentiable Torch encoding requires latent activations connected "
+                "to the input graph. Ensure inputs require gradients and the latent "
+                "data implementation does not detach activations."
+            )
 
         activations_original_shape = activations.shape[:-1]
         activations_flat = activations.reshape(-1, activations.shape[-1])

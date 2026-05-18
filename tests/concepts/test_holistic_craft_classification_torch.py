@@ -9,14 +9,109 @@ from PIL import Image
 from torchvision import models
 
 import xplique
+from tests.utils_functions.gradients_check_torch import check_model_gradients
 from xplique.attributions import Saliency
 from xplique.attributions.gradient_input import GradientInput
 from xplique.concepts import HolisticCraftTorch as Craft
 from xplique.concepts.holistic_craft import PartialExplainer
-from xplique.concepts.torch.layered_model_latent_extractor import LayeredModelExtractorBuilder
+from xplique.concepts.latent_extractor import LatentData
+from xplique.concepts.torch.latent_extractor import TorchLatentExtractor
+from xplique.concepts.torch.layered_model_latent_extractor import (
+    LayeredLatentData,
+    LayeredModelExtractorBuilder,
+)
 from xplique.utils_functions.classification.torch.classifier_tensor import ClassifierTensor
-from xplique.utils_functions.common.torch.gradients_check import check_model_gradients
 from xplique.wrappers import TorchWrapper
+
+
+class _BadDetachLatentData(LatentData):
+    """LatentData implementation that violates the detach return contract."""
+
+    def get_activations(self, as_numpy=True, keep_gradients=False):
+        return torch.ones((1, 2))
+
+    def set_activations(self, values):
+        self.values = values
+
+    def detach(self):
+        return None
+
+    def to(self, device):
+        return self
+
+
+def test_torch_layered_latent_data_protocol_roundtrip():
+    """Torch layered latent data implements detach/to and returns latent data."""
+    latent_data = LayeredLatentData(torch.ones((1, 3, 4, 4), requires_grad=True))
+
+    detached = latent_data.detach()
+    moved = detached.to("cpu")
+
+    assert detached is latent_data
+    assert isinstance(moved, LayeredLatentData)
+    assert moved.activations.device.type == "cpu"
+    assert not moved.activations.requires_grad
+
+
+def test_torch_latent_data_detach_must_return_latent_data():
+    """Invalid detach implementations fail with an explicit protocol error."""
+    extractor = TorchLatentExtractor(
+        torch.nn.Identity(),
+        input_to_latent_model=lambda inputs: LayeredLatentData(inputs),
+        latent_to_logit_model=lambda latent_data: latent_data.activations,
+        device="cpu",
+    )
+
+    with pytest.raises(TypeError, match="detach"):
+        extractor._detach_latent_data(_BadDetachLatentData())
+
+
+def test_torch_streaming_detaches_and_offloads_to_cpu_by_default():
+    """Non-gradient Torch streaming returns detached CPU latent batches by default."""
+    extractor = TorchLatentExtractor(
+        torch.nn.Identity(),
+        input_to_latent_model=lambda inputs: LayeredLatentData(inputs.clone()),
+        latent_to_logit_model=lambda latent_data: latent_data.activations,
+        batch_size=1,
+        device="cpu",
+    )
+    inputs = torch.ones((2, 3), requires_grad=True)
+
+    batches = list(extractor.iter_input_to_latent_batched(inputs))
+
+    assert len(batches) == 2
+    assert all(batch.activations.device.type == "cpu" for batch in batches)
+    assert all(not batch.activations.requires_grad for batch in batches)
+
+
+def test_torch_streaming_rejects_offload_with_gradients():
+    """Gradient-preserving Torch streaming cannot offload latent data."""
+    extractor = TorchLatentExtractor(
+        torch.nn.Identity(),
+        input_to_latent_model=lambda inputs: LayeredLatentData(inputs),
+        latent_to_logit_model=lambda latent_data: latent_data.activations,
+        batch_size=1,
+        device="cpu",
+    )
+
+    with pytest.raises(ValueError, match="offload_device"):
+        list(
+            extractor.iter_input_to_latent_batched(
+                torch.ones((1, 3), requires_grad=True),
+                keep_gradients=True,
+                offload_device="cpu",
+            )
+        )
+
+
+def test_torch_classifier_tensor_from_predictions():
+    """ClassifierTensor.from_predictions replaces the classifier formatter class."""
+    predictions = torch.ones((1, 3))
+
+    formatted = ClassifierTensor.from_predictions(predictions)
+
+    assert isinstance(formatted, ClassifierTensor)
+    assert ClassifierTensor.from_predictions(formatted) is formatted
 
 
 @pytest.fixture(params=["cpu", "cuda"])

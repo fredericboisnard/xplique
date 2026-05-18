@@ -25,6 +25,26 @@ class ClassifierTensor(torch.Tensor):
     - filter(class_id, confidence): No-op for classifiers (returns self)
     """
 
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        """Delegate torch operations while preserving Tensor subclass semantics.
+
+        PyTorch does not expose an equivalent of TensorFlow's ``__tf_tensor__``
+        conversion hook, so this class intentionally subclasses ``torch.Tensor``
+        to keep autograd and tensor operations available on formatted outputs.
+        Delegating here keeps the default PyTorch subclass behavior explicit.
+        """
+        if kwargs is None:
+            kwargs = {}
+        return super().__torch_function__(func, types, args, kwargs)
+
+    @classmethod
+    def from_predictions(cls, predictions):
+        """Wrap raw classifier predictions unless they are already formatted."""
+        if isinstance(predictions, cls):
+            return predictions
+        return cls(predictions)
+
     def to_batched_tensor(self) -> torch.Tensor:
         """
         Ensure tensor has batch dimension.

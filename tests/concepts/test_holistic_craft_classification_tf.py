@@ -7,14 +7,74 @@ import tensorflow as tf
 from PIL import Image
 
 import xplique
+from tests.utils_functions.gradients_check_tf import check_model_gradients
 from xplique.attributions import Saliency
 from xplique.attributions.gradient_input import GradientInput
 from xplique.concepts import HolisticCraftTf as Craft
 from xplique.concepts.holistic_craft import PartialExplainer
-from xplique.concepts.tf.layered_model_latent_extractor import LayeredModelExtractorBuilder
+from xplique.concepts.tf.latent_extractor import TfLatentExtractor
+from xplique.concepts.tf.layered_model_latent_extractor import (
+    LayeredLatentData,
+    LayeredModelExtractorBuilder,
+)
 from xplique.plots import plot_attributions
 from xplique.utils_functions.classification.tf.classifier_tensor import ClassifierTensor
-from xplique.utils_functions.common.tf.gradients_check import check_model_gradients
+
+
+def test_tf_layered_latent_data_protocol_roundtrip():
+    """TF layered latent data implements detach/to and returns latent data."""
+    latent_data = LayeredLatentData(tf.ones((1, 4, 4, 3)))
+
+    detached = latent_data.detach()
+    moved = detached.to("cpu")
+
+    assert detached is latent_data
+    assert isinstance(moved, LayeredLatentData)
+    np.testing.assert_allclose(moved.activations.numpy(), np.ones((1, 4, 4, 3)))
+
+
+def test_tf_streaming_detaches_by_default():
+    """Non-gradient TF streaming stops gradients through latent batches by default."""
+    extractor = TfLatentExtractor(
+        model=None,
+        input_to_latent_model=lambda inputs: LayeredLatentData(inputs * 2.0),
+        latent_to_logit_model=lambda latent_data: latent_data.activations,
+        batch_size=1,
+    )
+    inputs = tf.Variable(tf.ones((2, 3)))
+
+    with tf.GradientTape() as tape:
+        batches = list(extractor.iter_input_to_latent_batched(inputs))
+        loss = tf.reduce_sum(batches[0].activations)
+
+    assert tape.gradient(loss, inputs) is None
+
+
+def test_tf_streaming_rejects_offload_with_gradients():
+    """Gradient-preserving TF streaming cannot offload latent data."""
+    extractor = TfLatentExtractor(
+        model=None,
+        input_to_latent_model=lambda inputs: LayeredLatentData(inputs),
+        latent_to_logit_model=lambda latent_data: latent_data.activations,
+        batch_size=1,
+    )
+
+    with pytest.raises(ValueError, match="offload_device"):
+        list(
+            extractor.iter_input_to_latent_batched(
+                tf.ones((1, 3)), keep_gradients=True, offload_device="cpu"
+            )
+        )
+
+
+def test_tf_classifier_tensor_from_predictions():
+    """ClassifierTensor.from_predictions replaces the classifier formatter class."""
+    predictions = tf.ones((1, 3))
+
+    formatted = ClassifierTensor.from_predictions(predictions)
+
+    assert isinstance(formatted, ClassifierTensor)
+    assert ClassifierTensor.from_predictions(formatted) is formatted
 
 
 @pytest.fixture(params=["cpu", "gpu"])

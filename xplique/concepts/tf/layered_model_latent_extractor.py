@@ -7,10 +7,20 @@ from typing import Union
 import numpy as np
 import tensorflow as tf
 
-from xplique.utils_functions.classification.tf import TfClassifierFormatter
+from xplique.utils_functions.classification.tf import ClassifierTensor
 
 from ..latent_extractor import LatentData, LatentExtractorBuilder
 from .latent_extractor import TfLatentExtractor
+
+
+def _normalize_tf_device(device):
+    if isinstance(device, str):
+        device_name = device.lower()
+        if device_name == "cpu":
+            return "/CPU:0"
+        if device_name in ("cuda", "gpu"):
+            return "/GPU:0"
+    return device
 
 
 class LayeredLatentData(LatentData):
@@ -66,6 +76,16 @@ class LayeredLatentData(LatentData):
             New LayeredLatentData instance with selected samples.
         """
         return LayeredLatentData(self.activations[indices])
+
+    def detach(self) -> "LayeredLatentData":
+        """Detach activations from the gradient tape and return latent data."""
+        self.activations = tf.stop_gradient(self.activations)
+        return self
+
+    def to(self, device) -> "LayeredLatentData":
+        """Move activations to the requested TensorFlow device."""
+        with tf.device(_normalize_tf_device(device)):
+            return LayeredLatentData(tf.identity(self.activations))
 
     def get_activations(
         self, as_numpy: bool = True, keep_gradients: bool = False
@@ -213,7 +233,7 @@ class LayeredModelExtractorBuilder(LatentExtractorBuilder):
             g,
             h,
             latent_data_class=LayeredLatentData,
-            output_formatter=TfClassifierFormatter(),
+            output_formatter=ClassifierTensor.from_predictions,
             batch_size=batch_size,
         )
 
