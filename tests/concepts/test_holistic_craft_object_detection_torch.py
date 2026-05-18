@@ -8,6 +8,7 @@ import torchvision.transforms as T
 from PIL import Image
 
 import xplique
+from tests.utils_functions.gradients_check_torch import check_model_gradients
 from xplique.attributions import Saliency
 from xplique.attributions.gradient_input import GradientInput
 from xplique.concepts import HolisticCraftTorch as Craft
@@ -15,7 +16,6 @@ from xplique.concepts.holistic_craft import PartialExplainer
 from xplique.concepts.latent_extractor import LatentData
 from xplique.concepts.torch.latent_extractor import TorchLatentExtractor
 from xplique.plots import plot_attributions, plot_image_detections
-from xplique.utils_functions.common.torch.gradients_check import check_model_gradients
 from xplique.utils_functions.object_detection.base.box_manager import BoxFormat, BoxType
 from xplique.utils_functions.object_detection.torch.box_model_wrapper import TorchBoxesModelWrapper
 from xplique.utils_functions.object_detection.torch.multi_box_tensor import MultiBoxTensor
@@ -168,10 +168,12 @@ class MockTorchvisionLatentData(LatentData):
         self.activations = values
 
     def to(self, device):
-        """Move all data to specified device."""
-        self.device = device
-        self.activations = self.activations.to(device)
-        return self
+        """Return a new latent-data object on the specified device."""
+        return MockTorchvisionLatentData(
+            self.activations.to(device),
+            batch_size=self.batch_size,
+            device=device,
+        )
 
 
 class MockExtractorBuilder:
@@ -643,3 +645,178 @@ def test_craft_encode_differentiable_gradients(image_data, craft_data):
     # Verify gradients flowed back to input
     assert gradients is not None, "Gradients should flow back to input"
     assert gradients.abs().sum() > 0, "Gradients should be non-zero"
+
+
+def _build_simple_torch_latent_extractor(device):
+    """Build a lightweight extractor for latent memory-behavior tests."""
+
+    def input_to_latent_fn(inputs):
+        activations = inputs.permute(0, 2, 3, 1) * 2.0
+        return MockTorchvisionLatentData(
+            activations=activations,
+            batch_size=inputs.shape[0],
+            device=inputs.device,
+        )
+
+    def latent_to_logit_fn(latent_data):
+        return latent_data.get_activations(as_numpy=False, keep_gradients=True)
+
+    return TorchLatentExtractor(
+        model=torch.nn.Identity(),
+        input_to_latent_model=input_to_latent_fn,
+        latent_to_logit_model=latent_to_logit_fn,
+        batch_size=2,
+        device=str(device),
+    )
+
+
+def test_torch_input_to_latent_batched_offloads_to_cpu_by_default(device_param):
+    """Non-gradient latent accumulation should store detached CPU tensors by default."""
+    extractor = _build_simple_torch_latent_extractor(device_param)
+    inputs = torch.ones(2, 3, 4, 4, device=device_param, requires_grad=True)
+
+    latent_data_list = extractor.input_to_latent_batched(inputs)
+
+    assert len(latent_data_list) == 1
+    latent_data = latent_data_list[0]
+    assert latent_data.activations.device.type == "cpu"
+    assert not latent_data.activations.requires_grad
+
+
+def test_torch_input_to_latent_batched_can_keep_device(device_param):
+    """Device retention remains explicit for callers that need it."""
+    extractor = _build_simple_torch_latent_extractor(device_param)
+    inputs = torch.ones(2, 3, 4, 4, device=device_param)
+
+    latent_data_list = extractor.input_to_latent_batched(inputs, offload_device=None)
+
+    assert len(latent_data_list) == 1
+    assert latent_data_list[0].activations.device.type == device_param.type
+
+
+def test_torch_iter_input_to_latent_batched_preserves_gradients(device_param):
+    """Gradient-preserving latent streaming should keep the autograd graph intact."""
+    extractor = _build_simple_torch_latent_extractor(device_param)
+    inputs = torch.ones(2, 3, 4, 4, device=device_param, requires_grad=True)
+
+    latent_data_list = list(extractor.iter_input_to_latent_batched(inputs, keep_gradients=True))
+    latent_data = latent_data_list[0]
+
+    assert latent_data.activations.device.type == device_param.type
+    assert latent_data.activations.requires_grad
+
+    loss = latent_data.activations.sum()
+    loss.backward()
+
+    assert inputs.grad is not None
+    assert inputs.grad.abs().sum() > 0
+
+
+def test_torch_latent_offload_rejects_gradient_mode(device_param):
+    """CPU offload is explicitly incompatible with graph-preserving extraction."""
+    extractor = _build_simple_torch_latent_extractor(device_param)
+    inputs = torch.ones(2, 3, 4, 4, device=device_param, requires_grad=True)
+
+    with pytest.raises(ValueError, match="offload_device"):
+        list(
+            extractor.iter_input_to_latent_batched(
+                inputs,
+                keep_gradients=True,
+                offload_device="cpu",
+            )
+        )
+
+
+class _FittedDummyFactorizer:
+    """Minimal fitted factorizer for early validation tests."""
+
+    is_fitted = True
+
+    @property
+    def requires_positive_activations(self):
+        return True
+
+    def encode_differentiable(self, activations):
+        return activations[:, :2]
+
+
+def test_torch_differentiable_encoding_rejects_detached_activations(device_param):
+    """Differentiable mode should fail rather than creating fake leaf gradients."""
+    extractor = _build_simple_torch_latent_extractor(device_param)
+    craft = Craft(
+        latent_extractor=extractor,
+        number_of_concepts=2,
+        device=str(device_param),
+        factorizer=_FittedDummyFactorizer(),
+    )
+    latent_data = MockTorchvisionLatentData(
+        activations=torch.ones(1, 4, 4, 3, device=device_param),
+        batch_size=1,
+        device=device_param,
+    )
+
+    with pytest.raises(ValueError, match="connected to the input graph"):
+        craft.transform_latent_differentiable(latent_data)
+
+
+class _RecordingFactorizer:
+    """Factorizer that records fit inputs for streaming tests."""
+
+    def __init__(self):
+        self._is_fitted = False
+        self.fit_activations = None
+
+    @property
+    def is_fitted(self):
+        return self._is_fitted
+
+    @property
+    def requires_positive_activations(self):
+        return True
+
+    def fit(self, activations):
+        self.fit_activations = activations.copy()
+        self._is_fitted = True
+        concept_bank = np.ones((2, activations.shape[1]), dtype=np.float32)
+        coeffs_u = np.ones((activations.shape[0], 2), dtype=np.float32)
+        return concept_bank, coeffs_u
+
+
+class _StreamingOnlyExtractor:
+    """Extractor that fails if old list-materializing APIs are used."""
+
+    batch_size = 1
+
+    def __init__(self):
+        self.iter_called = False
+
+    def input_to_latent_batched(self, *args, **kwargs):
+        raise AssertionError("fit() should consume the streaming latent iterator")
+
+    def iter_input_to_latent_batched(self, inputs, resize=None, keep_gradients=False):
+        self.iter_called = True
+        for index in range(len(inputs)):
+            activations = torch.ones(1, 2, 2, 3) * float(index + 1)
+            yield MockTorchvisionLatentData(
+                activations=activations,
+                batch_size=1,
+                device="cpu",
+            )
+
+
+def test_holistic_craft_fit_streams_latent_batches():
+    """fit() should not materialize latent tensors through input_to_latent_batched()."""
+    extractor = _StreamingOnlyExtractor()
+    factorizer = _RecordingFactorizer()
+    craft = Craft(
+        latent_extractor=extractor,
+        number_of_concepts=2,
+        device="cpu",
+        factorizer=factorizer,
+    )
+
+    craft.fit(torch.ones(3, 3, 4, 4))
+
+    assert extractor.iter_called
+    assert factorizer.fit_activations.shape == (12, 3)
+    assert craft.factorization.coeffs_u.shape == (3, 2, 2, 2)

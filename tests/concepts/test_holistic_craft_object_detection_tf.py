@@ -8,6 +8,7 @@ import tensorflow as tf
 from PIL import Image
 
 import xplique
+from tests.utils_functions.gradients_check_tf import check_model_gradients
 from xplique.attributions import Saliency
 from xplique.attributions.gradient_input import GradientInput
 from xplique.concepts import HolisticCraftTf as Craft
@@ -15,7 +16,6 @@ from xplique.concepts.holistic_craft import PartialExplainer
 from xplique.concepts.latent_extractor import LatentData
 from xplique.concepts.tf.latent_extractor import TfLatentExtractor
 from xplique.plots import plot_attributions, plot_image_detections
-from xplique.utils_functions.common.tf.gradients_check import check_model_gradients
 from xplique.utils_functions.object_detection.base.box_manager import BoxFormat, BoxType
 from xplique.utils_functions.object_detection.tf.box_formatter import TfBaseBoxFormatter
 from xplique.utils_functions.object_detection.tf.box_model_wrapper import TfBoxesModelWrapper
@@ -191,6 +191,16 @@ class MockTfLatentData(LatentData):
     def __init__(self, activations: np.ndarray, batch_size=1):
         self.batch_size = batch_size
         self.activations = activations
+
+    def detach(self):
+        """Detach all tensors from the gradient tape."""
+        self.activations = tf.stop_gradient(self.activations)
+        return self
+
+    def to(self, device):
+        """Move all tensor data to the requested TensorFlow device."""
+        with tf.device(device):
+            return MockTfLatentData(tf.identity(self.activations), self.batch_size)
 
     def set_activations(self, values: np.ndarray):
         """Set activations."""
