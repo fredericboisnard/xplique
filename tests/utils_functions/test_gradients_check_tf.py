@@ -9,7 +9,7 @@ to ensure it correctly detects gradient flow in different model architectures.
 import pytest
 import tensorflow as tf
 
-from xplique.utils_functions.common.tf.gradients_check import check_model_gradients
+from tests.utils_functions.gradients_check_tf import check_model_gradients
 from xplique.utils_functions.object_detection.tf.multi_box_tensor import MultiBoxTensor
 
 

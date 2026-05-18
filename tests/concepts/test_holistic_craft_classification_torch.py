@@ -9,13 +9,13 @@ from PIL import Image
 from torchvision import models
 
 import xplique
+from tests.utils_functions.gradients_check_torch import check_model_gradients
 from xplique.attributions import Saliency
 from xplique.attributions.gradient_input import GradientInput
 from xplique.concepts import HolisticCraftTorch as Craft
 from xplique.concepts.holistic_craft import PartialExplainer
 from xplique.concepts.torch.layered_model_latent_extractor import LayeredModelExtractorBuilder
 from xplique.utils_functions.classification.torch.classifier_tensor import ClassifierTensor
-from xplique.utils_functions.common.torch.gradients_check import check_model_gradients
 from xplique.wrappers import TorchWrapper
 
 

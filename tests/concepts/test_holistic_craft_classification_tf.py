@@ -7,6 +7,7 @@ import tensorflow as tf
 from PIL import Image
 
 import xplique
+from tests.utils_functions.gradients_check_tf import check_model_gradients
 from xplique.attributions import Saliency
 from xplique.attributions.gradient_input import GradientInput
 from xplique.concepts import HolisticCraftTf as Craft

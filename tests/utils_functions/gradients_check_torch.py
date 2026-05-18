@@ -1,5 +1,5 @@
 """
-Utilities for checking gradient propagation in PyTorch models.
+PyTorch gradient checking test helpers.
 """
 
 # pylint: disable=duplicate-code
