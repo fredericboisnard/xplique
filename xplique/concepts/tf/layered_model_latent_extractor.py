@@ -7,7 +7,7 @@ from typing import Union
 import numpy as np
 import tensorflow as tf
 
-from xplique.utils_functions.classification.tf import TfClassifierFormatter
+from xplique.utils_functions.classification.tf import ClassifierTensor
 
 from ..latent_extractor import LatentData, LatentExtractorBuilder
 from .latent_extractor import TfLatentExtractor
@@ -233,7 +233,7 @@ class LayeredModelExtractorBuilder(LatentExtractorBuilder):
             g,
             h,
             latent_data_class=LayeredLatentData,
-            output_formatter=TfClassifierFormatter(),
+            output_formatter=ClassifierTensor.from_predictions,
             batch_size=batch_size,
         )
 

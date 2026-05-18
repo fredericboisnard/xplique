@@ -31,6 +31,13 @@ class ClassifierTensor:
     def __init__(self, tensor: tf.Tensor):
         self.tensor = tensor
 
+    @classmethod
+    def from_predictions(cls, predictions):
+        """Wrap raw classifier predictions unless they are already formatted."""
+        if isinstance(predictions, cls):
+            return predictions
+        return cls(predictions)
+
     @property
     def shape(self):
         """Return the shape of the underlying tensor for compatibility."""
