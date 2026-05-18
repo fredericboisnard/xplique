@@ -1,13 +1,10 @@
 """TensorFlow-specific latent extractor for object detection models."""
 
 from math import ceil
-from typing import Callable, Generator, List, Optional, Tuple, Union
+from typing import Any, Callable, Generator, List, Optional, Tuple, Union
 
 import tensorflow as tf
 
-from xplique.utils_functions.object_detection.base.box_formatter import (
-    BaseBoxFormatter,
-)
 from xplique.utils_functions.object_detection.tf.multi_box_tensor import MultiBoxTensor
 
 from ..latent_extractor import LatentData, LatentExtractor
@@ -49,7 +46,7 @@ class TfLatentExtractor(LatentExtractor):
         input_to_latent_model: Callable,
         latent_to_logit_model: Callable,
         latent_data_class=LatentData,
-        output_formatter: Optional[BaseBoxFormatter] = None,
+        output_formatter: Optional[Callable[[Any], Any]] = None,
         batch_size: int = 8,
     ) -> None:
         super().__init__(
@@ -162,6 +159,7 @@ class TfLatentExtractor(LatentExtractor):
         inputs: tf.Tensor,
         resize: Optional[Tuple[int, int]] = None,
         keep_gradients: bool = False,
+        offload_device: Optional[Any] = None,
     ) -> List[LatentData]:
         """
         Extract latent representations from batched inputs with optional resizing.
@@ -178,20 +176,36 @@ class TfLatentExtractor(LatentExtractor):
             If None, uses original image sizes.
         keep_gradients
             Whether to keep gradients during processing (for gradient-based methods)
+        offload_device
+            Optional device where yielded latent data should be stored. TensorFlow
+            extractors do not offload by default, but expose the same API as Torch.
 
         Returns
         -------
         latent_data_list
             List of LatentData objects, one for each batch processed
         """
-        latent_data_list = list(self._input_to_latent_generator(inputs, resize, keep_gradients))
+        latent_data_list = list(
+            self.iter_input_to_latent_batched(inputs, resize, keep_gradients, offload_device)
+        )
         return latent_data_list
+
+    def iter_input_to_latent_batched(
+        self,
+        inputs: tf.Tensor,
+        resize: Optional[Tuple[int, int]] = None,
+        keep_gradients: bool = False,
+        offload_device: Optional[Any] = None,
+    ) -> Generator[LatentData, None, None]:
+        """Stream latent representations batch by batch."""
+        yield from self._input_to_latent_generator(inputs, resize, keep_gradients, offload_device)
 
     def _input_to_latent_generator(
         self,
         inputs: tf.Tensor,
         resize: Optional[Tuple[int, int]] = None,
         keep_gradients: bool = False,
+        offload_device: Optional[Any] = None,
     ) -> Generator[LatentData, None, None]:
         # pylint: disable=unused-argument
         """
@@ -210,6 +224,9 @@ class TfLatentExtractor(LatentExtractor):
             If None, uses original image sizes.
         keep_gradients
             Whether to keep gradients during processing (for gradient-based methods)
+        offload_device
+            Optional device where yielded latent data should be stored. TensorFlow
+            extractors do not offload by default, but expose the same API as Torch.
 
         Yields
         ------
@@ -219,11 +236,18 @@ class TfLatentExtractor(LatentExtractor):
         if len(inputs.shape) == 3:
             inputs = tf.expand_dims(inputs, axis=0)
 
-        nb_batchs = ceil(len(inputs) / self.batch_size)
+        nb_inputs = inputs.shape[0]
+        if nb_inputs is None:
+            nb_inputs = int(tf.shape(inputs)[0].numpy())
+
+        nb_batchs = ceil(int(nb_inputs) / self.batch_size)
         start_ids = [i * self.batch_size for i in range(nb_batchs)]
 
+        if keep_gradients and offload_device is not None:
+            raise ValueError("offload_device is incompatible with keep_gradients=True")
+
         for i in start_ids:
-            i_end = min(i + self.batch_size, len(inputs))
+            i_end = min(i + self.batch_size, int(nb_inputs))
             batch = inputs[i:i_end]
 
             if resize:
@@ -231,6 +255,10 @@ class TfLatentExtractor(LatentExtractor):
 
             latent_data = self.input_to_latent_model(batch)
             del batch
+            if not keep_gradients:
+                latent_data = self._detach_latent_data(latent_data)
+            if offload_device is not None:
+                latent_data = self._move_latent_data(latent_data, offload_device)
             yield latent_data
 
     def latent_to_logit(self, latent_data: LatentData) -> Union[List[MultiBoxTensor], tf.Tensor]:
