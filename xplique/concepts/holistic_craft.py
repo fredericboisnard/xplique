@@ -195,6 +195,17 @@ class HolisticCraft(ABC):
         if not self.factorizer.is_fitted:
             raise NotFittedError("The factorization model has not been fitted to input data yet.")
 
+    def _iter_input_to_latent_batched(
+        self,
+        inputs: Union[np.ndarray, Any],
+        resize: Optional[Tuple[int, int]] = None,
+        keep_gradients: bool = False,
+    ):
+        """Stream latent batches from the latent extractor."""
+        yield from self.latent_extractor.iter_input_to_latent_batched(
+            inputs, resize, keep_gradients
+        )
+
     def fit(self, inputs, class_id: int = 0):
         """
         Fit NMF to extract concepts from latent activations.
@@ -215,14 +226,12 @@ class HolisticCraft(ABC):
             Target class ID for object detection (used in factorization metadata)
 
         """
-        # pass the data through the 1st part of the model
-        latent_data_list = self.latent_extractor.input_to_latent_batched(inputs)
-
-        # get the activations and concatenate as numpy arrays to minimize device memory usage
-        # Converting to numpy immediately frees device memory after each batch
-        activations = np.concatenate(
-            [latent_data.get_activations(as_numpy=True) for latent_data in latent_data_list], axis=0
-        )
+        # Convert each latent batch to numpy immediately to avoid accumulating
+        # framework tensors, especially live GPU tensors, across the dataset.
+        activation_batches = []
+        for latent_data in self._iter_input_to_latent_batched(inputs):
+            activation_batches.append(latent_data.get_activations(as_numpy=True))
+        activations = np.concatenate(activation_batches, axis=0)
 
         needs_reshape = len(activations.shape) > 2  # (N,H,W,C) or (N,Tokens,C)
         if needs_reshape:
@@ -285,10 +294,10 @@ class HolisticCraft(ABC):
                 raise ValueError("No stored coefficients available, and no inputs given.")
             return self.factorization.coeffs_u
 
-        # encode, but only return coeffs_u as a single tensor
-        encoded_data = self.encode(inputs, resize)
-        # extract coeffs_u using named attribute access for clarity
-        coeffs_u = np.concatenate([enc.coeffs_u for enc in encoded_data], axis=0)
+        # Encode as a stream, but only retain coeffs_u as a single tensor.
+        coeffs_u = np.concatenate(
+            [enc.coeffs_u for enc in self._iter_encoded(inputs, resize)], axis=0
+        )
         return coeffs_u
 
     def transform_latent(self, latent_data: LatentData) -> np.ndarray:
@@ -422,17 +431,24 @@ class HolisticCraft(ABC):
             When differentiable=True, coeffs_u are framework tensors
             (torch.Tensor or tf.Tensor) with gradients preserved.
         """
-        latent_data_list = self.latent_extractor.input_to_latent_batched(
+        return list(self._iter_encoded(inputs, resize, differentiable))
+
+    def _iter_encoded(
+        self,
+        inputs: Union[np.ndarray, Any],
+        resize: Optional[Tuple[int, int]] = None,
+        differentiable: bool = False,
+    ):
+        """Stream encoded latent batches and concept coefficients."""
+        latent_data_iter = self._iter_input_to_latent_batched(
             inputs, resize, keep_gradients=differentiable
         )
-        encoded_data = []
-        for latent_data in latent_data_list:
+        for latent_data in latent_data_iter:
             if differentiable:
                 coeffs_u = self.transform_latent_differentiable(latent_data)
             else:
                 coeffs_u = self.transform_latent(latent_data)
-            encoded_data.append(EncodedData(latent_data, coeffs_u))
-        return encoded_data
+            yield EncodedData(latent_data, coeffs_u)
 
     def decode(
         self, latent_data: LatentData, coeffs_u: Union[np.ndarray, Any]
@@ -541,6 +557,13 @@ class HolisticCraft(ABC):
         ------
         TypeError
             If partial_explainer is not a PartialExplainer instance
+
+        Notes
+        -----
+        The latent extractor is temporarily forced to ``batch_size=1`` because
+        object detection models may return a different number of detections per
+        image, making it impossible to stack results across a batch. Each image
+        must be encoded and explained independently.
         """
         if not isinstance(partial_explainer, PartialExplainer):
             raise TypeError(
@@ -552,15 +575,11 @@ class HolisticCraft(ABC):
 
         explanation_list = []
 
+        # Force batch_size=1 because object detection models can return a variable
+        # number of detection boxes per image, preventing batch-level stacking.
         with self.latent_extractor.temporary_force_batch_size(1):
-            # Encode images to get latent data and concept coefficients
-            # The list is composed of 1 EncodedData per image because
-            # object detection models can return various number of
-            # detection boxes per image
-            encoded_data_list = self.encode(images)
-
-            total_images = len(encoded_data_list)
-            for i, enc in enumerate(encoded_data_list):
+            total_images = len(images)
+            for i, enc in enumerate(self._iter_encoded(images)):
                 print(f"\rProcessing image {i + 1}/{total_images}...", end="", flush=True)
                 decoded_result = self.decode(enc.latent_data, enc.coeffs_u)
 
