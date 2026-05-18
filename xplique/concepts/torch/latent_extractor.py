@@ -2,28 +2,26 @@
 PyTorch-specific latent extractor implementations for object detection models.
 """
 
-from abc import abstractmethod
+import copy
 from contextlib import nullcontext
 from math import ceil
-from typing import Callable, Generator, List, Optional, Union
+from typing import Any, Callable, Generator, List, Optional, Union
 
 import torch
 
-from xplique.utils_functions.object_detection.base.box_formatter import (
-    BaseBoxFormatter,
-)
 from xplique.utils_functions.object_detection.torch.multi_box_tensor import MultiBoxTensor
 
 from ..latent_extractor import LatentData, LatentExtractor
+
+_DEFAULT_OFFLOAD_DEVICE = object()
 
 
 class TorchLatentData(LatentData):
     """
     Base class for PyTorch-based latent representations.
 
-    This abstract class provides a common interface for storing intermediate
+    This class provides a common interface for storing intermediate
     activations and positional encodings from PyTorch object detection models.
-    Subclasses must implement the detach method for gradient management.
 
     Attributes
     ----------
@@ -47,25 +45,49 @@ class TorchLatentData(LatentData):
         self.features = features
         self.pos = pos
 
-    @abstractmethod
     def detach(self) -> "TorchLatentData":
         """
         Detach all tensors from the computation graph.
 
-        This method must be implemented by subclasses to detach features
-        and positional encodings, preventing gradient computation.
+        This method detaches features and positional encodings, preventing
+        gradient computation. Subclasses that add extra tensor-containing
+        attributes must override this method to detach those fields as well.
 
         Returns
         -------
         latent_data
             Self reference after detaching tensors.
 
-        Raises
-        ------
-        NotImplementedError
-            If not implemented by subclass.
         """
-        raise NotImplementedError("detach method must be implemented by subclasses")
+        self.features = self._apply_to_tensors(self.features, lambda tensor: tensor.detach())
+        self.pos = self._apply_to_tensors(self.pos, lambda tensor: tensor.detach())
+        return self
+
+    def to(self, device: Union[str, torch.device]) -> "TorchLatentData":
+        """Return a new latent-data object with stored tensors on the requested device.
+
+        This implementation moves the ``features`` and ``pos`` attributes defined by this
+        class. Subclasses that add extra tensor-containing attributes must override this
+        method to move those fields as well.
+        """
+        latent_data = copy.copy(self)
+        latent_data.features = self._apply_to_tensors(
+            self.features, lambda tensor: tensor.to(device)
+        )
+        latent_data.pos = self._apply_to_tensors(self.pos, lambda tensor: tensor.to(device))
+        return latent_data
+
+    @staticmethod
+    def _apply_to_tensors(value, fn):
+        if isinstance(value, torch.Tensor):
+            return fn(value)
+        if isinstance(value, list):
+            return [TorchLatentData._apply_to_tensors(item, fn) for item in value]
+        if isinstance(value, tuple):
+            return tuple(TorchLatentData._apply_to_tensors(item, fn) for item in value)
+        if isinstance(value, dict):
+            return {key: TorchLatentData._apply_to_tensors(item, fn) for key, item in value.items()}
+        return value
 
 
 class TorchLatentExtractor(LatentExtractor):
@@ -94,7 +116,7 @@ class TorchLatentExtractor(LatentExtractor):
         input_to_latent_model: Callable,
         latent_to_logit_model: Callable,
         latent_data_class=LatentData,
-        output_formatter: Optional[BaseBoxFormatter] = None,
+        output_formatter: Optional[Callable[[Any], Any]] = None,
         batch_size: int = 8,
         device: str = "cuda",
     ):
@@ -162,6 +184,7 @@ class TorchLatentExtractor(LatentExtractor):
             Self reference for method chaining.
         """
         self.model.to(device)
+        self.device = device
         return self
 
     def zero_grad(self) -> "TorchLatentExtractor":
@@ -232,10 +255,8 @@ class TorchLatentExtractor(LatentExtractor):
             Concatenated predictions from all batches.
         """
         outputs = []
-        for latent_data in self._input_to_latent_generator(samples):
-            output = self.latent_to_logit_model(latent_data)
-            if self.output_formatter:
-                output = self.output_formatter(output)
+        for latent_data in self.iter_input_to_latent_batched(samples, offload_device=None):
+            output = self.latent_to_logit(latent_data)
             outputs.extend(output)
         return outputs
 
@@ -259,7 +280,11 @@ class TorchLatentExtractor(LatentExtractor):
         return latent_data
 
     def input_to_latent_batched(
-        self, inputs: torch.Tensor, resize: Optional[tuple] = None, keep_gradients: bool = False
+        self,
+        inputs: torch.Tensor,
+        resize: Optional[tuple] = None,
+        keep_gradients: bool = False,
+        offload_device: Any = _DEFAULT_OFFLOAD_DEVICE,
     ) -> List[LatentData]:
         """
         Extract latent representations with automatic batching.
@@ -272,17 +297,43 @@ class TorchLatentExtractor(LatentExtractor):
             Optional target size for resizing inputs. Default is None.
         keep_gradients
             If True, preserve gradients during processing. Default is False.
+        offload_device
+            Device where yielded latent data should be stored. By default, non-gradient
+            calls detach and offload to CPU, while gradient-preserving calls do not offload.
+            Pass None to disable offloading.
 
         Returns
         -------
         latent_data_list
             List of LatentData objects from each batch.
         """
-        latent_data_list = list(self._input_to_latent_generator(inputs, resize, keep_gradients))
+        latent_data_list = list(
+            self.iter_input_to_latent_batched(inputs, resize, keep_gradients, offload_device)
+        )
         return latent_data_list
 
+    def iter_input_to_latent_batched(
+        self,
+        inputs: torch.Tensor,
+        resize: Optional[tuple] = None,
+        keep_gradients: bool = False,
+        offload_device: Any = _DEFAULT_OFFLOAD_DEVICE,
+    ) -> Generator[LatentData, None, None]:
+        """
+        Stream latent representations batch by batch.
+
+        Non-gradient callers store CPU-detached latent data by default, avoiding
+        live GPU tensor accumulation when the iterator is materialized. Pass
+        offload_device=None to disable offloading.
+        """
+        yield from self._input_to_latent_generator(inputs, resize, keep_gradients, offload_device)
+
     def _input_to_latent_generator(
-        self, inputs: torch.Tensor, resize: Optional[tuple] = None, keep_gradients: bool = False
+        self,
+        inputs: torch.Tensor,
+        resize: Optional[tuple] = None,
+        keep_gradients: bool = False,
+        offload_device: Any = _DEFAULT_OFFLOAD_DEVICE,
     ) -> Generator[LatentData, None, None]:
         """
         Generator that yields latent data batch by batch.
@@ -295,17 +346,30 @@ class TorchLatentExtractor(LatentExtractor):
             Optional target size for resizing inputs. Default is None.
         keep_gradients
             If True, preserve gradients during processing. Default is False.
+        offload_device
+            Device where yielded latent data should be stored. By default, non-gradient
+            calls detach and offload to CPU, while gradient-preserving calls do not offload.
+            Pass None to disable offloading.
 
         Yields
         ------
         latent_data
             LatentData object for each batch, with automatic memory management.
+
+        Notes
+        -----
+        Non-gradient calls detach each latent batch and offload it to CPU before
+        yielding by default. This keeps ``input_to_latent_batched()`` from
+        materializing a list of live GPU tensors while still allowing
+        ``keep_gradients=True`` callers to preserve the computation graph.
         """
         if len(inputs.shape) == 3:
             inputs = inputs.unsqueeze(0)
 
         nb_batchs = ceil(len(inputs) / self.batch_size)
         start_ids = [i * self.batch_size for i in range(nb_batchs)]
+
+        offload_device = self._resolve_offload_device(keep_gradients, offload_device)
 
         context = nullcontext() if keep_gradients else torch.no_grad()
         with context:
@@ -320,8 +384,19 @@ class TorchLatentExtractor(LatentExtractor):
 
                 latent_data = self.input_to_latent_model(batch)
                 del batch
-                torch.cuda.empty_cache()
+                if not keep_gradients:
+                    latent_data = self._detach_latent_data(latent_data)
+                if offload_device is not None:
+                    latent_data = self._move_latent_data(latent_data, offload_device)
                 yield latent_data
+
+    @staticmethod
+    def _resolve_offload_device(keep_gradients: bool, offload_device: Any):
+        if offload_device is _DEFAULT_OFFLOAD_DEVICE:
+            offload_device = None if keep_gradients else "cpu"
+        if keep_gradients and offload_device is not None:
+            raise ValueError("offload_device is incompatible with keep_gradients=True")
+        return offload_device
 
     def latent_to_logit(self, latent_data: LatentData) -> List[MultiBoxTensor]:
         """
@@ -337,6 +412,7 @@ class TorchLatentExtractor(LatentExtractor):
         output
             Model predictions (boxes, scores, labels), optionally formatted.
         """
+        latent_data = self._move_latent_data(latent_data, self.device)
         output = self.latent_to_logit_model(latent_data)
         if self.output_formatter:
             output = self.output_formatter(output)
