@@ -33,6 +33,20 @@ class MultiBoxTensor(torch.Tensor):
     - probas(): Extract class probabilities
     """
 
+    @classmethod
+    def __torch_function__(cls, func, types, args=(), kwargs=None):
+        """Delegate torch operations while preserving Tensor subclass semantics.
+
+        ``MultiBoxTensor`` subclasses ``torch.Tensor`` so filtering, indexing, and
+        autograd all operate on the prediction tensor directly. PyTorch has no
+        composition-style tensor conversion hook equivalent to TensorFlow's
+        ``__tf_tensor__``, so this explicit delegation keeps the intended default
+        subclass behavior visible.
+        """
+        if kwargs is None:
+            kwargs = {}
+        return super().__torch_function__(func, types, args, kwargs)
+
     def __format__(self, format_spec: str) -> str:
         """
         Format the tensor as a string.
