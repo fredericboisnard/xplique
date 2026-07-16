@@ -191,7 +191,7 @@ class HolisticCraft(ABC):
         NotFittedError
             If the factorization model has not been fitted to input data.
         """
-        if not self.factorizer.is_fitted:
+        if not self.factorizer.is_fitted or self.factorization is None:
             raise NotFittedError("The factorization model has not been fitted to input data yet.")
 
     def fit(self, inputs, class_id: int = 0):
@@ -577,7 +577,12 @@ class HolisticCraft(ABC):
                 # for the explainer
                 filtered_result = decoded_result.filter(class_id=class_id, confidence=confidence)
                 expected_explanation_shape = tuple(enc.coeffs_u.shape)
-                if len(filtered_result) == 0:  # No detection
+                is_empty = (
+                    bool(filtered_result.is_empty)
+                    if hasattr(filtered_result, "is_empty")
+                    else len(filtered_result) == 0
+                )
+                if is_empty:  # No detection
                     explanation = np.zeros(expected_explanation_shape)
                     if verbose:
                         print(
@@ -972,20 +977,17 @@ class HolisticCraft(ABC):
             Importance scores for each concept, shape (n_concepts,)
         """
         if method == "gradient_input":
-            explainer = PartialExplainer(
-                GradientInput, operator=operator, reducer=None, **method_kwargs
-            )
+            method_kwargs.setdefault("operator", operator)
+            method_kwargs.setdefault("reducer", None)
+            explainer = PartialExplainer(GradientInput, **method_kwargs)
         elif method == "sobol":
             # set default values for Sobol-specific parameters if not provided
             method_kwargs.setdefault("grid_size", 8)
             method_kwargs.setdefault("nb_design", 32)
             method_kwargs.setdefault("perturbation_function", "amplitude")
-            explainer = PartialExplainer(
-                SobolAttributionMethod,
-                nb_channels=self.number_of_concepts,
-                operator=operator,
-                **method_kwargs,
-            )
+            method_kwargs.setdefault("nb_channels", self.number_of_concepts)
+            method_kwargs.setdefault("operator", operator)
+            explainer = PartialExplainer(SobolAttributionMethod, **method_kwargs)
         else:
             raise ValueError(f"Unknown attribution method: {method}")
 
