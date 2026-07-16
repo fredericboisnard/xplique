@@ -2,9 +2,10 @@
 
 import matplotlib.pyplot as plt
 import numpy as np
+import pytest
 
 from xplique.plots.image import generate_heatmap
-from xplique.plots.object_detection import plot_image_detections
+from xplique.plots.object_detection import plot_image_detections, plot_images_detections
 
 
 class _NumpyMultiBoxTensor:
@@ -48,3 +49,13 @@ def test_detection_heatmap_uses_the_image_coordinate_extent():
         assert heatmap_artist.get_extent() == image_artist.get_extent()
     finally:
         plt.close(fig)
+
+
+def test_plot_images_detections_rejects_empty_lists():
+    with pytest.raises(ValueError, match="at least one element"):
+        plot_images_detections(
+            [],
+            [],
+            classes_labels=["object", "other"],
+            label_to_color={"object": "red"},
+        )
