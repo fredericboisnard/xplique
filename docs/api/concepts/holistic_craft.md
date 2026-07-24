@@ -39,7 +39,7 @@ For standard classification models, Holistic CRAFT does not require a custom ext
 **TensorFlow:**
 - Any `tf.keras.Model` — `LayeredModelExtractorBuilder` (from `xplique.concepts.tf.layered_model_latent_extractor`)
 
-The builder takes the model and a layer index (or name) to define the split point. Everything before that layer becomes g(.), and everything after becomes h(.).
+The builder takes the model and a layer index to define the split point. Everything before that layer becomes g(.), and everything after becomes h(.).
 
 ## Key Differences from Regular CRAFT
 
@@ -83,6 +83,7 @@ This split is implemented through three abstractions:
 ### Basic Usage with Object Detection
 
 ```python
+import xplique
 from xplique.concepts import HolisticCraftTorch as Craft
 from xplique_adapters.concepts.torch.latent_data_retinanet import RetinanetExtractorBuilder
 
@@ -141,6 +142,7 @@ importances_sobol = craft.estimate_importance(
 Holistic CRAFT supports various attribution methods for concept importance estimation:
 
 ```python
+import xplique
 from xplique.concepts import PartialExplainer
 from xplique.attributions import VarGrad
 
@@ -190,7 +192,7 @@ factorizer = OvercompleteFactorizer(
 craft = Craft(
     latent_extractor=latent_extractor,
     number_of_concepts=nb_concepts,
-    device=devide,
+    device=device,
     factorizer=factorizer,
 )
 
@@ -210,7 +212,7 @@ from xplique.concepts.latent_extractor import LatentData
 import torch
 
 class CustomLatentData(LatentData):
-    def __init__(self, fpn_outs: tuple, extraction_layer: int = 0):
+    def __init__(self, fpn_outs: list, extraction_layer: int = 0):
         super().__init__()
         self.fpn_outs = fpn_outs
         self.extraction_layer = extraction_layer
@@ -240,7 +242,7 @@ class CustomLatentData(LatentData):
 
     def to(self, device: torch.device) -> 'CustomLatentData':
         """Move latent data to specified device."""
-        self.fpn_outs = tuple(fpn_out.to(device) for fpn_out in self.fpn_outs)
+        self.fpn_outs = [fpn_out.to(device) for fpn_out in self.fpn_outs]
         return CustomLatentData(self.fpn_outs, self.extraction_layer)
 ```
 
@@ -268,7 +270,7 @@ class CustomExtractorBuilder(LatentExtractorBuilder):
             # Example: extract from backbone/feature pyramid
             fpn_outs = self.backbone(x)
             return CustomLatentData(
-                fpn_outs=fpn_outs,
+                fpn_outs=list(fpn_outs),
                 extraction_layer=latent_extractor.extraction_layer
             )
 

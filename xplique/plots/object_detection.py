@@ -69,7 +69,7 @@ def _draw_boxes_on_ax(
     ax.imshow(image)
 
     if heatmap is not None:
-        ax.imshow(heatmap, cmap=cmap, alpha=alpha)
+        ax.imshow(heatmap, cmap=cmap, alpha=alpha, extent=ax.images[0].get_extent())
 
     boxes = multibox_results.boxes()
     scores = multibox_results.scores()
@@ -240,9 +240,12 @@ def plot_images_detections(
     Raises
     ------
     ValueError
-        If the number of images and multibox_results are not equal.
+        If inputs are empty, or if the number of images and multibox_results are not equal.
     """
     # Validate inputs
+    if not images or not multibox_results_list:
+        raise ValueError("images and multibox_results_list must contain at least one element")
+
     if len(images) != len(multibox_results_list):
         raise ValueError(
             f"Number of images ({len(images)}) must match number of multibox_results "

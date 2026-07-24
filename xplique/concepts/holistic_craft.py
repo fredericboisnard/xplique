@@ -2,7 +2,6 @@
 Framework-agnostic CRAFT implementation for holistic model explanations.
 """
 
-import warnings
 from abc import ABC, abstractmethod
 from typing import Any, Callable, List, Optional, Tuple, Union
 
@@ -38,7 +37,7 @@ def show_ax(img, ax, **kwargs):
         channel-last (H, W, C) format
     ax
         Matplotlib axis object on which to display the image
-    **kwargs
+    kwargs
         Additional keyword arguments passed to ax.imshow()
     """
     img = np.array(img, dtype=np.float32)
@@ -65,7 +64,7 @@ class PartialExplainer:
     explainer_class
         The explainer class to instantiate (e.g., GradientInput, SobolAttributionMethod).
         Must be callable and accept 'model' and 'batch_size' as keyword arguments.
-    **kwargs
+    kwargs
         Configuration arguments for the explainer (e.g., operator, reducer, grid_size).
         Should NOT include 'model' or 'batch_size' as these will be provided during
         instantiation.
@@ -192,7 +191,7 @@ class HolisticCraft(ABC):
         NotFittedError
             If the factorization model has not been fitted to input data.
         """
-        if not self.factorizer.is_fitted:
+        if not self.factorizer.is_fitted or self.factorization is None:
             raise NotFittedError("The factorization model has not been fitted to input data yet.")
 
     def fit(self, inputs, class_id: int = 0):
@@ -221,6 +220,8 @@ class HolisticCraft(ABC):
             latent_data.get_activations(as_numpy=True)
             for latent_data in self.latent_extractor.input_to_latent_generator(inputs)
         ]
+        if not activations_list:
+            raise ValueError("No activations extracted from inputs.")
         activations = np.concatenate(activations_list, axis=0)
 
         needs_reshape = len(activations.shape) > 2  # (N,H,W,C) or (N,Tokens,C)
@@ -244,7 +245,9 @@ class HolisticCraft(ABC):
             coeffs_u = coeffs_u.reshape(*activations_original_shape, -1)
 
         self.factorization = Factorization(
+            inputs=None,
             class_id=class_id,
+            crops=None,
             reducer=self.factorizer,
             concept_bank_w=concept_bank_w,
             crops_u=None,
@@ -286,6 +289,8 @@ class HolisticCraft(ABC):
 
         # encode, but only return coeffs_u as a single tensor
         encoded_data = self.encode(inputs, resize)
+        if not encoded_data:
+            raise ValueError("No activations extracted from inputs.")
         # extract coeffs_u using named attribute access for clarity
         coeffs_u = np.concatenate([enc.coeffs_u for enc in encoded_data], axis=0)
         return coeffs_u
@@ -472,6 +477,24 @@ class HolisticCraft(ABC):
         if not isinstance(latent_data, LatentData):
             raise ValueError("decode() only accepts a single LatentData as input")
 
+        result = self._decode_coefficients(latent_data, coeffs_u)
+
+        # Public decoding returns one structured prediction. Internal attribution
+        # decoding uses _decode_coefficients() directly to handle perturbation batches.
+        if isinstance(result, list):
+            if len(result) != 1:
+                raise ValueError(
+                    f"Expected single-element list for single LatentData, "
+                    f"got {len(result)} elements"
+                )
+            result = result[0]
+
+        return result
+
+    def _decode_coefficients(
+        self, latent_data: LatentData, coeffs_u: Union[np.ndarray, Any]
+    ) -> Any:
+        """Reconstruct latent activations and return raw formatted predictions."""
         self.check_if_fitted()
 
         # Convert coeffs_u to framework tensor if needed
@@ -486,21 +509,7 @@ class HolisticCraft(ABC):
 
         # Set activations and decode through model
         latent_data.set_activations(activations)
-        result = self.latent_extractor.latent_to_logit(latent_data)
-
-        # latent_to_logit may return either:
-        # - A list with 1 element (e.g., PyTorch formatters always return lists)
-        # - A single tensor directly (e.g., TensorFlow with batch_size=1)
-        # Extract single prediction if in list form
-        if isinstance(result, list):
-            if len(result) != 1:
-                raise ValueError(
-                    f"Expected single-element list for single LatentData, "
-                    f"got {len(result)} elements"
-                )
-            result = result[0]
-
-        return result
+        return self.latent_extractor.latent_to_logit(latent_data)
 
     def compute_explanation_per_concept(
         self,
@@ -553,12 +562,16 @@ class HolisticCraft(ABC):
 
         explanation_list = []
 
+        # Targets and decoder metadata are prepared per image. Each explainer can
+        # still batch coefficient perturbations using the configured batch size.
         with self.latent_extractor.temporary_force_batch_size(1):
             # Encode images to get latent data and concept coefficients
             # The list is composed of 1 EncodedData per image because
             # object detection models can return various number of
             # detection boxes per image
             encoded_data_list = self.encode(images)
+            if not encoded_data_list:
+                raise ValueError("No latent data extracted from inputs.")
 
             total_images = len(encoded_data_list)
             for i, enc in enumerate(encoded_data_list):
@@ -569,13 +582,13 @@ class HolisticCraft(ABC):
                 # Filter the output boxes predicted to get targets of the studied class
                 # for the explainer
                 filtered_result = decoded_result.filter(class_id=class_id, confidence=confidence)
-                expected_explanation_shape = (
-                    1,
-                    enc.coeffs_u.shape[1],
-                    enc.coeffs_u.shape[2],
-                    enc.coeffs_u.shape[3],
+                expected_explanation_shape = tuple(enc.coeffs_u.shape)
+                is_empty = (
+                    bool(filtered_result.is_empty)
+                    if hasattr(filtered_result, "is_empty")
+                    else len(filtered_result) == 0
                 )
-                if len(filtered_result) == 0:  # No detection
+                if is_empty:  # No detection
                     explanation = np.zeros(expected_explanation_shape)
                     if verbose:
                         print(
@@ -585,13 +598,15 @@ class HolisticCraft(ABC):
                 else:
                     targets = self._to_numpy(filtered_result.to_batched_tensor())
                     decoder = self.make_concept_decoder(enc.latent_data)
-                    explainer_instance = partial_explainer(model=decoder, batch_size=1)
+                    explainer_instance = partial_explainer(
+                        model=decoder, batch_size=self.batch_size
+                    )
 
                     # Explain the importance of each concept w.r.t the targets
                     explanation = explainer_instance.explain(enc.coeffs_u, targets)
-                    explanation = explanation.numpy()
+                    explanation = self._to_numpy(explanation)
                     if explanation.shape != expected_explanation_shape:
-                        warnings.warn(
+                        raise ValueError(
                             f"Explanation shape {explanation.shape} does not match expected shape "
                             f"{expected_explanation_shape} for image {i}. Check that the explainer "
                             f"and concept decoder are correctly implemented."
@@ -667,6 +682,16 @@ class HolisticCraft(ABC):
                     f"because Tokens is not a perfect square."
                 )
             coeffs_u = coeffs_u.reshape(num_images, height, width, num_concepts)
+        elif len(coeffs_u.shape) != 4:
+            raise ValueError(
+                "coeffs_u must have shape (N, H, W, n_concepts) or (N, tokens, n_concepts)"
+            )
+
+        if coeffs_u.shape[-1] != self.number_of_concepts:
+            raise ValueError(
+                f"coeffs_u contains {coeffs_u.shape[-1]} concepts, expected "
+                f"{self.number_of_concepts}"
+            )
 
         # convert images to HWC numpy format for display
         if self.framework == "torch":
@@ -678,7 +703,26 @@ class HolisticCraft(ABC):
         if order is None:
             concepts_id = list(range(self.number_of_concepts))
         else:
-            concepts_id = order
+            try:
+                concepts_id = list(order)
+            except TypeError as error:
+                raise ValueError("order must be an iterable of concept IDs") from error
+            if not concepts_id:
+                raise ValueError("order must contain at least one concept ID")
+            if len(concepts_id) > self.number_of_concepts:
+                raise ValueError("order cannot contain more IDs than number_of_concepts")
+            if any(
+                not isinstance(concept_id, (int, np.integer))
+                or isinstance(concept_id, bool)
+                or not 0 <= concept_id < self.number_of_concepts
+                for concept_id in concepts_id
+            ):
+                raise ValueError(
+                    f"order concept IDs must be integers between 0 and "
+                    f"{self.number_of_concepts - 1}"
+                )
+            if len(set(concepts_id)) != len(concepts_id):
+                raise ValueError("order cannot contain duplicate concept IDs")
 
         return images_np, coeffs_u, concepts_id
 
@@ -777,11 +821,11 @@ class HolisticCraft(ABC):
             images, coeffs_u, order
         )
 
-        nb_cols = min(len(concepts_id), self.number_of_concepts)
+        nb_cols = len(concepts_id)
         nb_rows = len(images_np)
 
         fig, axs = plt.subplots(nb_rows, nb_cols, figsize=(2 * nb_cols, 2 * nb_rows))
-        axs = np.atleast_2d(axs)  # fix issue when nb_rows == 1
+        axs = np.asarray(axs).reshape(nb_rows, nb_cols)
 
         for i, c_i in enumerate(concepts_id):
             axs[0, i].set_title(f"concept #{c_i}", fontsize=10)
@@ -865,9 +909,9 @@ class HolisticCraft(ABC):
         )
 
         nb_rows = topk
-        nb_cols = min(len(concepts_id), self.number_of_concepts)
+        nb_cols = len(concepts_id)
         fig, axs = plt.subplots(nb_rows, nb_cols, figsize=(2 * nb_cols, 2 * nb_rows))
-        axs = np.atleast_2d(axs)
+        axs = np.asarray(axs).reshape(nb_rows, nb_cols)
 
         for i, c_i in enumerate(concepts_id):
             axs[0, i].set_title(f"concept #{c_i}", fontsize=10)
@@ -941,20 +985,17 @@ class HolisticCraft(ABC):
             Importance scores for each concept, shape (n_concepts,)
         """
         if method == "gradient_input":
-            explainer = PartialExplainer(
-                GradientInput, operator=operator, reducer=None, **method_kwargs
-            )
+            method_kwargs.setdefault("operator", operator)
+            method_kwargs.setdefault("reducer", None)
+            explainer = PartialExplainer(GradientInput, **method_kwargs)
         elif method == "sobol":
             # set default values for Sobol-specific parameters if not provided
             method_kwargs.setdefault("grid_size", 8)
             method_kwargs.setdefault("nb_design", 32)
             method_kwargs.setdefault("perturbation_function", "amplitude")
-            explainer = PartialExplainer(
-                SobolAttributionMethod,
-                nb_channels=self.number_of_concepts,
-                operator=operator,
-                **method_kwargs,
-            )
+            method_kwargs.setdefault("nb_channels", self.number_of_concepts)
+            method_kwargs.setdefault("operator", operator)
+            explainer = PartialExplainer(SobolAttributionMethod, **method_kwargs)
         else:
             raise ValueError(f"Unknown attribution method: {method}")
 
@@ -1013,8 +1054,9 @@ class HolisticCraft(ABC):
         }
         if abs_before_reduce:
             explanation = np.abs(explanation)
-        if spatial_reducer is not None:
-            explanation = reducers[spatial_reducer](explanation, axis=(1, 2))
+        spatial_axes = tuple(range(1, explanation.ndim - 1))
+        if spatial_reducer is not None and spatial_axes:
+            explanation = reducers[spatial_reducer](explanation, axis=spatial_axes)
         if aggregation_reducer is not None:
             importances = reducers[aggregation_reducer](explanation, axis=0)
         else:
@@ -1044,7 +1086,10 @@ class HolisticCraft(ABC):
             Fraction of images for which each concept is dominant, shape (n_concepts,).
             Values sum to 1.
         """
-        per_image = np.mean(explanation, axis=(1, 2))  # (N, n_concepts)
+        spatial_axes = tuple(range(1, explanation.ndim - 1))
+        per_image = (
+            np.mean(explanation, axis=spatial_axes) if spatial_axes else explanation
+        )  # (N, n_concepts)
         dominant = np.argmax(per_image, axis=-1)  # (N,)
         prevalence = np.zeros(self.number_of_concepts)
         for c in range(self.number_of_concepts):
@@ -1080,7 +1125,10 @@ class HolisticCraft(ABC):
             Concepts with no dominant image get a reliability of 0.0.
         """
         accuracy = np.asarray(accuracy)
-        per_image = np.mean(explanation, axis=(1, 2))  # (N, n_concepts)
+        spatial_axes = tuple(range(1, explanation.ndim - 1))
+        per_image = (
+            np.mean(explanation, axis=spatial_axes) if spatial_axes else explanation
+        )  # (N, n_concepts)
         dominant = np.argmax(per_image, axis=-1)  # (N,)
         reliability = np.zeros(self.number_of_concepts)
         for c in range(self.number_of_concepts):
@@ -1096,8 +1144,10 @@ class ConceptDecoder:
     Converts concept coefficients back to object detection predictions by
     reconstructing activations and passing them through the decoder network.
 
-    Parameters
+    Attributes
     ----------
+    parent_craft
+        HolisticCraft instance used to decode predictions
     latent_data
         Image-specific latent representation to use for decoding
     """
@@ -1123,23 +1173,17 @@ class ConceptDecoder:
         Parameters
         ----------
         coeffs_u
-            Concept coefficients with batch size 1
+            Batched concept coefficients.
 
         Returns
         -------
         logits
-            Detection predictions as batched tensor
-
-        Raises
-        ------
-        ValueError
-            If coeffs_u batch size is not 1
+            Predictions as a dense batched tensor. Object detections are zero-padded
+            to the largest number of boxes in the batch.
         """
-        if coeffs_u.shape[0] != 1:
-            raise ValueError(
-                f"ConceptDecoder._decode() only accepts coeffs_u with "
-                f"batch size 1, got {coeffs_u.shape}"
-            )
-        nbc_tensor = self.parent_craft.decode(self.latent_data, coeffs_u)
-        logits = nbc_tensor.to_batched_tensor()
-        return logits
+        predictions = self.parent_craft._decode_coefficients(self.latent_data, coeffs_u)
+        return self._predictions_to_tensor(predictions)
+
+    def _predictions_to_tensor(self, predictions):
+        """Convert framework-specific structured predictions to a dense tensor."""
+        raise NotImplementedError

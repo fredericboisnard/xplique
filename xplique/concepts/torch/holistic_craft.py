@@ -1,12 +1,15 @@
 """PyTorch-specific wrapper for HolisticCraft."""
 
-from typing import Optional, Union
+from typing import Any, Optional, Union
 
 import numpy as np
 import torch
 from torch import nn
 
 from xplique.concepts.factorizer import ConceptFactorizer
+from xplique.utils_functions.object_detection.torch.box_model_wrapper import (
+    _pad_and_stack_box_predictions,
+)
 from xplique.wrappers import TorchWrapper
 
 from ..holistic_craft import ConceptDecoder, HolisticCraft
@@ -29,7 +32,7 @@ class HolisticCraftTorch(HolisticCraft):
         number_of_concepts
             Number of concepts to extract (default: 20)
         device
-            PyTorch device ('cuda' or 'cpu') (default: 'cuda')
+            PyTorch device. If None, uses the latent extractor device.
         factorizer
             Optional factorizer instance. If None, creates a TorchSklearnNMFFactorizer
             with alpha_W=1e-2 and max_iter=200
@@ -39,7 +42,7 @@ class HolisticCraftTorch(HolisticCraft):
         self,
         latent_extractor: LatentExtractor,
         number_of_concepts: int = 20,
-        device: str = "cuda",
+        device: Optional[Union[str, torch.device]] = None,
         factorizer: Optional[ConceptFactorizer] = None,
     ) -> None:
         """
@@ -52,7 +55,7 @@ class HolisticCraftTorch(HolisticCraft):
         number_of_concepts
             Number of concepts to extract (default: 20)
         device
-            PyTorch device ('cuda' or 'cpu') (default: 'cuda')
+            PyTorch device. If None, uses the latent extractor device.
         factorizer
             Optional factorizer instance. If None, creates a TorchSklearnNMFFactorizer
             with alpha_W=1e-2 and max_iter=200
@@ -63,6 +66,8 @@ class HolisticCraftTorch(HolisticCraft):
                 n_components=number_of_concepts, alpha_W=1e-2, max_iter=200
             )
 
+        if device is None:
+            device = latent_extractor.device
         super().__init__(latent_extractor, number_of_concepts, device, factorizer)
         self.framework = "torch"
         self._framework_module = torch
@@ -117,14 +122,14 @@ class HolisticCraftTorch(HolisticCraft):
         coeffs_u = coeffs_u.reshape(*activations_original_shape, -1)
         return coeffs_u
 
-    def _to_numpy(self, tensor: Union[torch.Tensor, np.ndarray]) -> np.ndarray:
+    def _to_numpy(self, tensor: Any) -> np.ndarray:
         """
         Convert PyTorch tensor to numpy array.
 
         Parameters
         ----------
         tensor
-            PyTorch tensor or numpy array
+            PyTorch tensor, TensorFlow tensor, or numpy array
 
         Returns
         -------
@@ -133,7 +138,11 @@ class HolisticCraftTorch(HolisticCraft):
         """
         if isinstance(tensor, np.ndarray):
             return tensor
-        return tensor.detach().cpu().numpy()
+        if isinstance(tensor, torch.Tensor):
+            return tensor.detach().cpu().numpy()
+        if hasattr(tensor, "numpy"):
+            return tensor.numpy()
+        return np.asarray(tensor)
 
     def _to_tensor(self, array: np.ndarray, dtype: Optional[torch.dtype] = None) -> torch.Tensor:
         """
@@ -200,17 +209,6 @@ class ConceptDecoderTorch(nn.Module, ConceptDecoder):
         self.parent_craft = parent_craft
         self.latent_data = latent_data
 
-    # def set_latent_data(self, latent_data: LatentData) -> None:
-    #     """
-    #     Update the latent data for this decoder.
-
-    #     Parameters
-    #     ----------
-    #     latent_data
-    #         New latent representation to use
-    #     """
-    #     self.latent_data = latent_data
-
     def forward(self, coeffs_u: torch.Tensor) -> torch.Tensor:
         """
         Decode concept coefficients to predictions.
@@ -218,26 +216,20 @@ class ConceptDecoderTorch(nn.Module, ConceptDecoder):
         Parameters
         ----------
         coeffs_u
-            Concept coefficients with batch size 1
+            Batched concept coefficients.
 
         Returns
         -------
         logits
-            Detection predictions as batched tensor
-
-        Raises
-        ------
-        ValueError
-            If coeffs_u batch size is not 1
+            Predictions as a dense batched tensor. Object detections are zero-padded
+            to the largest number of boxes in the batch.
         """
 
         return self._decode(coeffs_u)
 
-    #     if coeffs_u.shape[0] != 1:
-    #         raise ValueError(
-    #             f"ConceptDecoder.forward() only accepts coeffs_u with "
-    #             f"batch size 1, got {coeffs_u.shape}"
-    #         )
-    #     nbc_tensor = self.parent_craft.decode(self.latent_data, coeffs_u)
-    #     logits = nbc_tensor.to_batched_tensor()
-    #     return logits
+    def _predictions_to_tensor(self, predictions) -> torch.Tensor:
+        if isinstance(predictions, (list, tuple)):
+            return _pad_and_stack_box_predictions(predictions)
+        if hasattr(predictions, "to_batched_tensor"):
+            return predictions.to_batched_tensor()
+        return predictions
